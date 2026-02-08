@@ -14,6 +14,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
+# Comma-separated Discord IDs allowed to MANAGE the league (teams + ranking)
 ALLOWED_IDS = set(
     int(x.strip())
     for x in os.getenv("ALLOWED_IDS", "").split(",")
@@ -54,28 +55,6 @@ def require_allowed_only():
                 await interaction.response.send_message(msg, ephemeral=True)
             return False
         return True
-
-    return app_commands.check(predicate)
-
-
-def require_view_auth():
-    """
-    Optional: who can VIEW things.
-    Currently: ALLOWED_IDS OR server admins.
-    Change this to require_allowed_only() if you want viewers locked too.
-    """
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.id in ALLOWED_IDS:
-            return True
-        if interaction.user.guild_permissions.administrator:
-            return True
-
-        msg = "❌ You are not authorized to use this bot."
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-        return False
 
     return app_commands.check(predicate)
 
@@ -355,12 +334,11 @@ async def unrank(interaction: discord.Interaction, robloxuser: str):
 
 
 # -------------------------
-# Viewing commands (kept as ALLOWED_IDS or Admins)
+# Viewing commands (PUBLIC)
 # -------------------------
 
 @bot.tree.command(name="teamview", description="View a team’s owner/manager/players.")
 @app_commands.describe(teamname="Team name")
-@require_view_auth()
 async def teamview(interaction: discord.Interaction, teamname: str):
     assert pool is not None
 
@@ -410,7 +388,6 @@ async def teamview(interaction: discord.Interaction, teamname: str):
 
 @bot.tree.command(name="playerinfo", description="Show info about a Roblox player.")
 @app_commands.describe(robloxuser="Roblox username")
-@require_view_auth()
 async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     assert pool is not None
 
@@ -453,7 +430,7 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
 
 @teamview.autocomplete("teamname")
 async def teamname_autocomplete(interaction: discord.Interaction, current: str):
-    # include Free Agent in teamview suggestions (handy)
+    # include Free Agent in teamview suggestions
     names = await fetch_team_names_like(current, include_free_agent=True)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
@@ -477,6 +454,8 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
 # -------------------------
 
 bot.run(TOKEN)
+
+
 
 
 
