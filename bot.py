@@ -316,8 +316,14 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     await interaction.response.send_message(embed=embed)
 
 
+# --- Start ---
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing. Put it in your .env file.")
+    # Print what Railway is actually seeing (safe: doesn't print the token)
+    print("ENV CHECK: DISCORD_TOKEN is missing or empty.")
+    print("ENV CHECK: Available keys include:", ", ".join(sorted(list(os.environ.keys()))[:30]), "...")
+    raise RuntimeError("DISCORD_TOKEN is missing. Add it in Railway -> Service -> Variables.")
 
 bot.run(TOKEN)
+
+
 
