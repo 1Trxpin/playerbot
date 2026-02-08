@@ -1,5 +1,4 @@
 import os
-import math
 import datetime as dt
 
 import discord
@@ -32,7 +31,7 @@ pool: asyncpg.Pool | None = None
 # -------------------------
 
 def utc_now_iso() -> str:
-    # timezone-aware UTC timestamp (no deprecation warning)
+    # timezone-aware UTC timestamp
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
@@ -44,7 +43,7 @@ def rbxthumb_asset(asset_id: int) -> str:
 
 
 def is_authorized(interaction: discord.Interaction) -> bool:
-    # Allowed IDs OR server admins can use commands
+    # General bot usage (rank/view/info): allowed IDs OR server admins
     if interaction.user.id in ALLOWED_IDS:
         return True
     if interaction.user.guild_permissions.administrator:
@@ -56,6 +55,21 @@ def require_auth():
     async def predicate(interaction: discord.Interaction) -> bool:
         if not is_authorized(interaction):
             msg = "❌ You are not authorized to use this bot."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return False
+        return True
+
+    return app_commands.check(predicate)
+
+
+def require_team_admin():
+    # Team management (create/update/delete): ONLY allowed IDs
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.id not in ALLOWED_IDS:
+            msg = "❌ Only league staff (ALLOWED_IDS) can manage teams."
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
             else:
@@ -133,17 +147,17 @@ async def on_ready():
 
 
 # -------------------------
-# Commands
+# Commands (Team management locked)
 # -------------------------
 
-@bot.tree.command(name="setteam", description="Create/update a league team (owner/manager/logo).")
+@bot.tree.command(name="setteam", description="Create/update a league team (staff only).")
 @app_commands.describe(
     team="Team name (league team)",
     owner="Owner Roblox username",
     manager="Manager Roblox username (optional)",
     logo_asset_id="Roblox image asset id (optional)"
 )
-@require_auth()
+@require_team_admin()
 async def setteam(
     interaction: discord.Interaction,
     team: str,
@@ -180,6 +194,40 @@ async def setteam(
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="deleteteam", description="Delete a league team (staff only).")
+@app_commands.describe(teamname="Team name to delete")
+@require_team_admin()
+async def deleteteam(interaction: discord.Interaction, teamname: str):
+    assert pool is not None
+
+    async with pool.acquire() as conn:
+        # Block deletion if the team still has players
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM players WHERE team_name=$1",
+            teamname
+        )
+        if count and int(count) > 0:
+            return await interaction.response.send_message(
+                f"❌ Cannot delete **{teamname}** because it has **{count}** players.\n"
+                f"Move/remove those players first.",
+                ephemeral=True
+            )
+
+        result = await conn.execute(
+            "DELETE FROM teams WHERE name=$1",
+            teamname
+        )
+
+    if result.endswith("0"):
+        return await interaction.response.send_message("❌ Team not found.", ephemeral=True)
+
+    await interaction.response.send_message(f"✅ Deleted team **{teamname}**.")
+
+
+# -------------------------
+# Commands (Rank / View / Info)
+# -------------------------
+
 @bot.tree.command(name="rankplayer", description="Rank/assign a Roblox player to a league team.")
 @app_commands.describe(
     robloxuser="Roblox username",
@@ -197,7 +245,7 @@ async def rankplayer(
     now = utc_now_iso()
 
     async with pool.acquire() as conn:
-        # ✅ HARD BLOCK: team must exist in league
+        # Team must exist in league
         exists = await conn.fetchval("SELECT 1 FROM teams WHERE name=$1", team)
         if not exists:
             return await interaction.response.send_message(
@@ -262,25 +310,20 @@ async def teamview(interaction: discord.Interaction, teamname: str):
             teamname
         )
 
-    owner_roblox = team_row["owner_roblox"]
-    manager_roblox = team_row["manager_roblox"]
-    logo_asset_id = team_row["logo_asset_id"]
-
     embed = discord.Embed(
         title=f"Information for {teamname} ({len(players)} Players)",
         color=discord.Color.dark_teal(),
     )
-    embed.add_field(name="Owner", value=owner_roblox, inline=False)
-    embed.add_field(name="Manager", value=manager_roblox or "None", inline=False)
+    embed.add_field(name="Owner", value=team_row["owner_roblox"], inline=False)
+    embed.add_field(name="Manager", value=team_row["manager_roblox"] or "None", inline=False)
 
-    if logo_asset_id:
-        embed.set_thumbnail(url=rbxthumb_asset(int(logo_asset_id)))
-        embed.add_field(name="Logo Asset ID", value=str(logo_asset_id), inline=False)
+    if team_row["logo_asset_id"]:
+        embed.set_thumbnail(url=rbxthumb_asset(int(team_row["logo_asset_id"])))
+        embed.add_field(name="Logo Asset ID", value=str(team_row["logo_asset_id"]), inline=False)
 
     if not players:
         embed.add_field(name="Players", value="None", inline=False)
     else:
-        # chunk into multiple fields if needed
         lines = [f"{p['roblox_user']} ({p['rank'] or 'None'})" for p in players]
         chunk = ""
         part = 1
@@ -326,7 +369,6 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     embed.add_field(name="Team", value=row["team_name"], inline=True)
     embed.add_field(name="Rank", value=row["rank"] or "None", inline=True)
     embed.add_field(name="Last Update", value=row["updated_at"], inline=False)
-
     embed.add_field(name="Team Owner", value=row["owner_roblox"] or "Unknown", inline=True)
     embed.add_field(name="Team Manager", value=row["manager_roblox"] or "None", inline=True)
 
@@ -341,16 +383,20 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
 # Autocomplete (Dropdowns)
 # -------------------------
 
-# ✅ Makes /teamview look like your screenshot (type "s" and see matching teams)
 @teamview.autocomplete("teamname")
 async def teamname_autocomplete(interaction: discord.Interaction, current: str):
     names = await fetch_team_names_like(current)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 
-# ✅ Makes /rankplayer ONLY show league teams (prevents typing Liverpool by mistake)
 @rankplayer.autocomplete("team")
 async def rankplayer_team_autocomplete(interaction: discord.Interaction, current: str):
+    names = await fetch_team_names_like(current)
+    return [app_commands.Choice(name=n, value=n) for n in names]
+
+
+@deleteteam.autocomplete("teamname")
+async def deleteteam_autocomplete(interaction: discord.Interaction, current: str):
     names = await fetch_team_names_like(current)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
@@ -359,6 +405,8 @@ async def rankplayer_team_autocomplete(interaction: discord.Interaction, current
 # Run
 # -------------------------
 bot.run(TOKEN)
+
+
 
 
 
