@@ -447,6 +447,52 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
     # Exclude Free Agent from delete dropdown
     names = await fetch_team_names_like(current, include_free_agent=False)
     return [app_commands.Choice(name=n, value=n) for n in names]
+from aiohttp import web
+
+routes = web.RouteTableDef()
+
+
+@routes.get("/leaderboard")
+async def leaderboard_api(request):
+    """Return all players + team logos for Roblox."""
+    assert pool is not None
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.roblox_user, p.team_name, t.logo_asset_id
+            FROM players p
+            LEFT JOIN teams t ON t.name = p.team_name
+            ORDER BY LOWER(p.roblox_user)
+            """
+        )
+
+    data = [
+        {
+            "player": r["roblox_user"],
+            "team": r["team_name"],
+            "logo": r["logo_asset_id"],
+        }
+        for r in rows
+    ]
+
+    return web.json_response(data)
+
+
+async def start_web_server():
+    app = web.Application()
+    app.add_routes(routes)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", 8000)
+    await site.start()
+
+
+@bot.event
+async def setup_hook():
+    await start_web_server()
 
 
 # -------------------------
@@ -454,6 +500,7 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
 # -------------------------
 
 bot.run(TOKEN)
+
 
 
 
