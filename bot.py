@@ -6,6 +6,8 @@ from discord import app_commands
 from discord.ext import commands
 
 import asyncpg
+import aiohttp
+from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,6 +29,9 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 pool: asyncpg.Pool | None = None
 
 FREE_AGENT_TEAM = "Free Agent"
+
+# ---------- AIOHTTP WEB ----------
+routes = web.RouteTableDef()
 
 
 # -------------------------
@@ -59,7 +64,35 @@ def require_allowed_only():
     return app_commands.check(predicate)
 
 
+async def roblox_username_to_userid(username: str) -> int | None:
+    """
+    Convert Roblox username -> userId using Roblox official API.
+    This is the "best fix" because userId never changes.
+    """
+    username = (username or "").strip()
+    if not username:
+        return None
+
+    url = "https://users.roblox.com/v1/usernames/users"
+    payload = {"usernames": [username], "excludeBannedUsers": False}
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+
+    items = data.get("data", [])
+    if not items:
+        return None
+    return int(items[0]["id"])
+
+
 async def init_db():
+    """
+    IMPORTANT: We store players by roblox_user_id (stable), not username.
+    """
     assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -70,16 +103,21 @@ async def init_db():
                 logo_asset_id BIGINT
             );
         """)
+
+        # New players table (UserId-based)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS players (
-                roblox_user TEXT PRIMARY KEY,
+                roblox_user_id BIGINT PRIMARY KEY,
+                roblox_username TEXT NOT NULL,
                 team_name TEXT NOT NULL REFERENCES teams(name) ON DELETE RESTRICT,
                 rank TEXT,
                 updated_at TEXT NOT NULL
             );
         """)
 
-        # Ensure "Free Agent" team always exists (so /unrank can move players there)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_name);")
+
+        # Ensure "Free Agent" team always exists
         await conn.execute(
             """
             INSERT INTO teams (name, owner_roblox, manager_roblox, logo_asset_id)
@@ -125,6 +163,19 @@ async def fetch_team_names_like(current: str, include_free_agent: bool = True) -
 # -------------------------
 # Bot lifecycle
 # -------------------------
+
+@bot.event
+async def setup_hook():
+    # Start the web server (Railway public domain -> /leaderboard)
+    app = web.Application()
+    app.add_routes(routes)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", 8000)
+    await site.start()
+
 
 @bot.event
 async def on_ready():
@@ -214,7 +265,6 @@ async def deleteteam(interaction: discord.Interaction, teamname: str):
         )
 
     async with pool.acquire() as conn:
-        # Block deletion if the team still has players
         count = await conn.fetchval(
             "SELECT COUNT(*) FROM players WHERE team_name=$1",
             teamname
@@ -238,7 +288,7 @@ async def deleteteam(interaction: discord.Interaction, teamname: str):
 
 
 # -------------------------
-# Player ranking (LOCKED to ALLOWED_IDS)
+# Player ranking (LOCKED to ALLOWED_IDS) — USERID FIX
 # -------------------------
 
 @bot.tree.command(name="rankplayer", description="Assign a Roblox player to a league team (staff only).")
@@ -248,12 +298,7 @@ async def deleteteam(interaction: discord.Interaction, teamname: str):
     rank="Rank (Player/Manager/Owner/etc.)"
 )
 @require_allowed_only()
-async def rankplayer(
-    interaction: discord.Interaction,
-    robloxuser: str,
-    team: str,
-    rank: str,
-):
+async def rankplayer(interaction: discord.Interaction, robloxuser: str, team: str, rank: str):
     assert pool is not None
     now = utc_now_iso()
 
@@ -263,30 +308,37 @@ async def rankplayer(
             ephemeral=True
         )
 
+    user_id = await roblox_username_to_userid(robloxuser)
+    if not user_id:
+        return await interaction.response.send_message(
+            f"❌ Could not find Roblox user **{robloxuser}**.",
+            ephemeral=True
+        )
+
     async with pool.acquire() as conn:
         exists = await conn.fetchval("SELECT 1 FROM teams WHERE name=$1", team)
         if not exists:
             return await interaction.response.send_message(
-                f"❌ **{team}** is not a valid league team.\n"
-                f"Create it first with `/setteam`.",
+                f"❌ **{team}** is not a valid league team.\nCreate it first with `/setteam`.",
                 ephemeral=True
             )
 
         old_team = await conn.fetchval(
-            "SELECT team_name FROM players WHERE roblox_user=$1",
-            robloxuser
+            "SELECT team_name FROM players WHERE roblox_user_id=$1",
+            user_id
         )
 
         await conn.execute(
             """
-            INSERT INTO players (roblox_user, team_name, rank, updated_at)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (roblox_user) DO UPDATE SET
+            INSERT INTO players (roblox_user_id, roblox_username, team_name, rank, updated_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (roblox_user_id) DO UPDATE SET
+                roblox_username = EXCLUDED.roblox_username,
                 team_name = EXCLUDED.team_name,
                 rank = EXCLUDED.rank,
                 updated_at = EXCLUDED.updated_at;
             """,
-            robloxuser, team, rank, now
+            user_id, robloxuser, team, rank, now
         )
 
         logo_asset_id = await conn.fetchval(
@@ -302,6 +354,7 @@ async def rankplayer(
         desc = f"✅ **{robloxuser}** added to **{team}** as **{rank}**"
 
     embed = discord.Embed(title="Player Ranked", description=desc, color=discord.Color.green())
+    embed.add_field(name="Roblox UserId", value=str(user_id), inline=False)
     embed.add_field(name="Updated", value=now, inline=False)
     if logo_asset_id:
         embed.set_thumbnail(url=rbxthumb_asset(int(logo_asset_id)))
@@ -316,18 +369,25 @@ async def unrank(interaction: discord.Interaction, robloxuser: str):
     assert pool is not None
     now = utc_now_iso()
 
+    user_id = await roblox_username_to_userid(robloxuser)
+    if not user_id:
+        return await interaction.response.send_message(
+            f"❌ Could not find Roblox user **{robloxuser}**.",
+            ephemeral=True
+        )
+
     async with pool.acquire() as conn:
-        # If player doesn't exist, create them as Free Agent
         await conn.execute(
             """
-            INSERT INTO players (roblox_user, team_name, rank, updated_at)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (roblox_user) DO UPDATE SET
+            INSERT INTO players (roblox_user_id, roblox_username, team_name, rank, updated_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (roblox_user_id) DO UPDATE SET
+                roblox_username = EXCLUDED.roblox_username,
                 team_name = EXCLUDED.team_name,
                 rank = EXCLUDED.rank,
                 updated_at = EXCLUDED.updated_at;
             """,
-            robloxuser, FREE_AGENT_TEAM, "Free Agent", now
+            user_id, robloxuser, FREE_AGENT_TEAM, "Free Agent", now
         )
 
     await interaction.response.send_message(f"✅ **{robloxuser}** is now a **Free Agent**.")
@@ -351,7 +411,7 @@ async def teamview(interaction: discord.Interaction, teamname: str):
             return await interaction.response.send_message("❌ Team not found.", ephemeral=True)
 
         players = await conn.fetch(
-            "SELECT roblox_user, rank FROM players WHERE team_name=$1 ORDER BY LOWER(roblox_user)",
+            "SELECT roblox_username, rank FROM players WHERE team_name=$1 ORDER BY LOWER(roblox_username)",
             teamname
         )
 
@@ -369,7 +429,7 @@ async def teamview(interaction: discord.Interaction, teamname: str):
     if not players:
         embed.add_field(name="Players", value="None", inline=False)
     else:
-        lines = [f"{p['roblox_user']} ({p['rank'] or 'None'})" for p in players]
+        lines = [f"{p['roblox_username']} ({p['rank'] or 'None'})" for p in players]
         chunk = ""
         part = 1
         for line in lines:
@@ -391,25 +451,33 @@ async def teamview(interaction: discord.Interaction, teamname: str):
 async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     assert pool is not None
 
+    user_id = await roblox_username_to_userid(robloxuser)
+    if not user_id:
+        return await interaction.response.send_message(
+            f"❌ Could not find Roblox user **{robloxuser}**.",
+            ephemeral=True
+        )
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT p.team_name, p.rank, p.updated_at,
+            SELECT p.team_name, p.rank, p.updated_at, p.roblox_user_id, p.roblox_username,
                    t.logo_asset_id, t.owner_roblox, t.manager_roblox
             FROM players p
             LEFT JOIN teams t ON t.name = p.team_name
-            WHERE p.roblox_user=$1
+            WHERE p.roblox_user_id=$1
             """,
-            robloxuser
+            user_id
         )
 
     if not row:
         return await interaction.response.send_message("❌ Player not found.", ephemeral=True)
 
     embed = discord.Embed(
-        title=f"{robloxuser}'s Information!",
+        title=f"{row['roblox_username']}'s Information!",
         color=discord.Color.orange(),
     )
+    embed.add_field(name="Roblox UserId", value=str(row["roblox_user_id"]), inline=False)
     embed.add_field(name="Team", value=row["team_name"], inline=True)
     embed.add_field(name="Rank", value=row["rank"] or "None", inline=True)
     embed.add_field(name="Last Update", value=row["updated_at"], inline=False)
@@ -430,48 +498,47 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
 
 @teamview.autocomplete("teamname")
 async def teamname_autocomplete(interaction: discord.Interaction, current: str):
-    # include Free Agent in teamview suggestions
     names = await fetch_team_names_like(current, include_free_agent=True)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 
 @rankplayer.autocomplete("team")
 async def rankplayer_team_autocomplete(interaction: discord.Interaction, current: str):
-    # EXCLUDE Free Agent from rank dropdown (use /unrank instead)
     names = await fetch_team_names_like(current, include_free_agent=False)
-    return [app_commands.Choice(name=n, value=n) for n in names]
+    return [app_commands.Choice(name=n, value=n) for n in names
 
 
 @deleteteam.autocomplete("teamname")
 async def deleteteam_autocomplete(interaction: discord.Interaction, current: str):
-    # Exclude Free Agent from delete dropdown
     names = await fetch_team_names_like(current, include_free_agent=False)
     return [app_commands.Choice(name=n, value=n) for n in names]
-from aiohttp import web
 
-routes = web.RouteTableDef()
 
+# -------------------------
+# WEB API (Roblox pulls this)
+# -------------------------
 
 @routes.get("/leaderboard")
 async def leaderboard_api(request):
-    """Return all players + team logos for Roblox."""
+    """Return all players + team logos for Roblox (UserId-based)."""
     assert pool is not None
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT p.roblox_user, p.team_name, t.logo_asset_id
+            SELECT p.roblox_user_id, p.roblox_username, p.team_name, t.logo_asset_id
             FROM players p
             LEFT JOIN teams t ON t.name = p.team_name
-            ORDER BY LOWER(p.roblox_user)
+            ORDER BY LOWER(p.roblox_username)
             """
         )
 
     data = [
         {
-            "player": r["roblox_user"],
+            "userId": int(r["roblox_user_id"]),
+            "username": r["roblox_username"],
             "team": r["team_name"],
-            "logo": r["logo_asset_id"],
+            "logo": r["logo_asset_id"],  # may be null
         }
         for r in rows
     ]
@@ -479,27 +546,13 @@ async def leaderboard_api(request):
     return web.json_response(data)
 
 
-async def start_web_server():
-    app = web.Application()
-    app.add_routes(routes)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    site = web.TCPSite(runner, "0.0.0.0", 8000)
-    await site.start()
-
-
-@bot.event
-async def setup_hook():
-    await start_web_server()
-
-
 # -------------------------
 # Run
 # -------------------------
 
 bot.run(TOKEN)
+
+
 
 
 
