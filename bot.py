@@ -25,13 +25,14 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 pool: asyncpg.Pool | None = None
 
+FREE_AGENT_TEAM = "Free Agent"
+
 
 # -------------------------
 # Helpers
 # -------------------------
 
 def utc_now_iso() -> str:
-    # timezone-aware UTC timestamp
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
@@ -42,19 +43,11 @@ def rbxthumb_asset(asset_id: int) -> str:
     )
 
 
-def is_authorized(interaction: discord.Interaction) -> bool:
-    # General bot usage (rank/view/info): allowed IDs OR server admins
-    if interaction.user.id in ALLOWED_IDS:
-        return True
-    if interaction.user.guild_permissions.administrator:
-        return True
-    return False
-
-
-def require_auth():
+def require_allowed_only():
+    """ONLY Discord IDs in ALLOWED_IDS can use the command."""
     async def predicate(interaction: discord.Interaction) -> bool:
-        if not is_authorized(interaction):
-            msg = "❌ You are not authorized to use this bot."
+        if interaction.user.id not in ALLOWED_IDS:
+            msg = "❌ Only league staff (ALLOWED_IDS) can use this command."
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
             else:
@@ -65,17 +58,24 @@ def require_auth():
     return app_commands.check(predicate)
 
 
-def require_team_admin():
-    # Team management (create/update/delete): ONLY allowed IDs
+def require_view_auth():
+    """
+    Optional: who can VIEW things.
+    Currently: ALLOWED_IDS OR server admins.
+    Change this to require_allowed_only() if you want viewers locked too.
+    """
     async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.id not in ALLOWED_IDS:
-            msg = "❌ Only league staff (ALLOWED_IDS) can manage teams."
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-            return False
-        return True
+        if interaction.user.id in ALLOWED_IDS:
+            return True
+        if interaction.user.guild_permissions.administrator:
+            return True
+
+        msg = "❌ You are not authorized to use this bot."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return False
 
     return app_commands.check(predicate)
 
@@ -100,23 +100,46 @@ async def init_db():
             );
         """)
 
+        # Ensure "Free Agent" team always exists (so /unrank can move players there)
+        await conn.execute(
+            """
+            INSERT INTO teams (name, owner_roblox, manager_roblox, logo_asset_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (name) DO NOTHING;
+            """,
+            FREE_AGENT_TEAM, "System", None, None
+        )
 
-async def fetch_team_names_like(current: str) -> list[str]:
+
+async def fetch_team_names_like(current: str, include_free_agent: bool = True) -> list[str]:
     """Return up to 25 team names matching the typed text."""
     assert pool is not None
     current = (current or "").strip().lower()
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT name
-            FROM teams
-            WHERE LOWER(name) LIKE $1
-            ORDER BY name
-            LIMIT 25
-            """,
-            f"%{current}%",
-        )
+        if include_free_agent:
+            rows = await conn.fetch(
+                """
+                SELECT name
+                FROM teams
+                WHERE LOWER(name) LIKE $1
+                ORDER BY name
+                LIMIT 25
+                """,
+                f"%{current}%",
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT name
+                FROM teams
+                WHERE name <> $1 AND LOWER(name) LIKE $2
+                ORDER BY name
+                LIMIT 25
+                """,
+                FREE_AGENT_TEAM, f"%{current}%",
+            )
+
     return [r["name"] for r in rows]
 
 
@@ -136,7 +159,6 @@ async def on_ready():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await init_db()
 
-    # Sync slash commands to your server (fast updates)
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
@@ -147,7 +169,7 @@ async def on_ready():
 
 
 # -------------------------
-# Commands (Team management locked)
+# Team management (LOCKED to ALLOWED_IDS)
 # -------------------------
 
 @bot.tree.command(name="setteam", description="Create/update a league team (staff only).")
@@ -157,7 +179,7 @@ async def on_ready():
     manager="Manager Roblox username (optional)",
     logo_asset_id="Roblox image asset id (optional)"
 )
-@require_team_admin()
+@require_allowed_only()
 async def setteam(
     interaction: discord.Interaction,
     team: str,
@@ -166,6 +188,12 @@ async def setteam(
     logo_asset_id: int | None = None,
 ):
     assert pool is not None
+
+    if team.strip().lower() == FREE_AGENT_TEAM.lower():
+        return await interaction.response.send_message(
+            f"❌ `{FREE_AGENT_TEAM}` is reserved. You cannot edit it.",
+            ephemeral=True
+        )
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -196,9 +224,15 @@ async def setteam(
 
 @bot.tree.command(name="deleteteam", description="Delete a league team (staff only).")
 @app_commands.describe(teamname="Team name to delete")
-@require_team_admin()
+@require_allowed_only()
 async def deleteteam(interaction: discord.Interaction, teamname: str):
     assert pool is not None
+
+    if teamname.strip().lower() == FREE_AGENT_TEAM.lower():
+        return await interaction.response.send_message(
+            f"❌ `{FREE_AGENT_TEAM}` is reserved and cannot be deleted.",
+            ephemeral=True
+        )
 
     async with pool.acquire() as conn:
         # Block deletion if the team still has players
@@ -209,7 +243,7 @@ async def deleteteam(interaction: discord.Interaction, teamname: str):
         if count and int(count) > 0:
             return await interaction.response.send_message(
                 f"❌ Cannot delete **{teamname}** because it has **{count}** players.\n"
-                f"Move/remove those players first.",
+                f"Move/unrank those players first.",
                 ephemeral=True
             )
 
@@ -225,16 +259,16 @@ async def deleteteam(interaction: discord.Interaction, teamname: str):
 
 
 # -------------------------
-# Commands (Rank / View / Info)
+# Player ranking (LOCKED to ALLOWED_IDS)
 # -------------------------
 
-@bot.tree.command(name="rankplayer", description="Rank/assign a Roblox player to a league team.")
+@bot.tree.command(name="rankplayer", description="Assign a Roblox player to a league team (staff only).")
 @app_commands.describe(
     robloxuser="Roblox username",
     team="League team (must exist)",
     rank="Rank (Player/Manager/Owner/etc.)"
 )
-@require_auth()
+@require_allowed_only()
 async def rankplayer(
     interaction: discord.Interaction,
     robloxuser: str,
@@ -244,13 +278,18 @@ async def rankplayer(
     assert pool is not None
     now = utc_now_iso()
 
+    if team.strip().lower() == FREE_AGENT_TEAM.lower():
+        return await interaction.response.send_message(
+            f"❌ Use `/unrank robloxuser: {robloxuser}` to set Free Agent.",
+            ephemeral=True
+        )
+
     async with pool.acquire() as conn:
-        # Team must exist in league
         exists = await conn.fetchval("SELECT 1 FROM teams WHERE name=$1", team)
         if not exists:
             return await interaction.response.send_message(
                 f"❌ **{team}** is not a valid league team.\n"
-                f"Create it first with `/setteam` (example: AC Milan).",
+                f"Create it first with `/setteam`.",
                 ephemeral=True
             )
 
@@ -291,9 +330,37 @@ async def rankplayer(
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="teamview", description="View a league team’s owner/manager/players.")
+@bot.tree.command(name="unrank", description="Set a player to Free Agent (staff only).")
+@app_commands.describe(robloxuser="Roblox username")
+@require_allowed_only()
+async def unrank(interaction: discord.Interaction, robloxuser: str):
+    assert pool is not None
+    now = utc_now_iso()
+
+    async with pool.acquire() as conn:
+        # If player doesn't exist, create them as Free Agent
+        await conn.execute(
+            """
+            INSERT INTO players (roblox_user, team_name, rank, updated_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (roblox_user) DO UPDATE SET
+                team_name = EXCLUDED.team_name,
+                rank = EXCLUDED.rank,
+                updated_at = EXCLUDED.updated_at;
+            """,
+            robloxuser, FREE_AGENT_TEAM, "Free Agent", now
+        )
+
+    await interaction.response.send_message(f"✅ **{robloxuser}** is now a **Free Agent**.")
+
+
+# -------------------------
+# Viewing commands (kept as ALLOWED_IDS or Admins)
+# -------------------------
+
+@bot.tree.command(name="teamview", description="View a team’s owner/manager/players.")
 @app_commands.describe(teamname="Team name")
-@require_auth()
+@require_view_auth()
 async def teamview(interaction: discord.Interaction, teamname: str):
     assert pool is not None
 
@@ -341,9 +408,9 @@ async def teamview(interaction: discord.Interaction, teamname: str):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="playerinfo", description="Show league info about a Roblox player.")
+@bot.tree.command(name="playerinfo", description="Show info about a Roblox player.")
 @app_commands.describe(robloxuser="Roblox username")
-@require_auth()
+@require_view_auth()
 async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     assert pool is not None
 
@@ -369,6 +436,7 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     embed.add_field(name="Team", value=row["team_name"], inline=True)
     embed.add_field(name="Rank", value=row["rank"] or "None", inline=True)
     embed.add_field(name="Last Update", value=row["updated_at"], inline=False)
+
     embed.add_field(name="Team Owner", value=row["owner_roblox"] or "Unknown", inline=True)
     embed.add_field(name="Team Manager", value=row["manager_roblox"] or "None", inline=True)
 
@@ -385,26 +453,32 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
 
 @teamview.autocomplete("teamname")
 async def teamname_autocomplete(interaction: discord.Interaction, current: str):
-    names = await fetch_team_names_like(current)
+    # include Free Agent in teamview suggestions (handy)
+    names = await fetch_team_names_like(current, include_free_agent=True)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 
 @rankplayer.autocomplete("team")
 async def rankplayer_team_autocomplete(interaction: discord.Interaction, current: str):
-    names = await fetch_team_names_like(current)
+    # EXCLUDE Free Agent from rank dropdown (use /unrank instead)
+    names = await fetch_team_names_like(current, include_free_agent=False)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 
 @deleteteam.autocomplete("teamname")
 async def deleteteam_autocomplete(interaction: discord.Interaction, current: str):
-    names = await fetch_team_names_like(current)
+    # Exclude Free Agent from delete dropdown
+    names = await fetch_team_names_like(current, include_free_agent=False)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 
 # -------------------------
 # Run
 # -------------------------
+
 bot.run(TOKEN)
+
+
 
 
 
