@@ -1,16 +1,19 @@
 import os
+import math
 import datetime as dt
+
 import discord
 from discord import app_commands
 from discord.ext import commands
+
 import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 ALLOWED_IDS = set(
     int(x.strip())
@@ -24,9 +27,24 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 pool: asyncpg.Pool | None = None
 
 
-# ---------- Helpers ----------
+# -------------------------
+# Helpers
+# -------------------------
+
+def utc_now_iso() -> str:
+    # timezone-aware UTC timestamp (no deprecation warning)
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def rbxthumb_asset(asset_id: int) -> str:
+    return (
+        "https://www.roblox.com/asset-thumbnail/image"
+        f"?assetId={asset_id}&width=420&height=420&format=png"
+    )
+
 
 def is_authorized(interaction: discord.Interaction) -> bool:
+    # Allowed IDs OR server admins can use commands
     if interaction.user.id in ALLOWED_IDS:
         return True
     if interaction.user.guild_permissions.administrator:
@@ -48,13 +66,6 @@ def require_auth():
     return app_commands.check(predicate)
 
 
-def rbxthumb_asset(asset_id: int) -> str:
-    return (
-        "https://www.roblox.com/asset-thumbnail/image"
-        f"?assetId={asset_id}&width=420&height=420&format=png"
-    )
-
-
 async def init_db():
     assert pool is not None
     async with pool.acquire() as conn:
@@ -69,45 +80,68 @@ async def init_db():
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 roblox_user TEXT PRIMARY KEY,
-                team_name TEXT NOT NULL REFERENCES teams(name),
+                team_name TEXT NOT NULL REFERENCES teams(name) ON DELETE RESTRICT,
                 rank TEXT,
                 updated_at TEXT NOT NULL
             );
         """)
 
 
-# ---------- Ready ----------
+async def fetch_team_names_like(current: str) -> list[str]:
+    """Return up to 25 team names matching the typed text."""
+    assert pool is not None
+    current = (current or "").strip().lower()
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT name
+            FROM teams
+            WHERE LOWER(name) LIKE $1
+            ORDER BY name
+            LIMIT 25
+            """,
+            f"%{current}%",
+        )
+    return [r["name"] for r in rows]
+
+
+# -------------------------
+# Bot lifecycle
+# -------------------------
 
 @bot.event
 async def on_ready():
     global pool
 
     if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN missing.")
-
+        raise RuntimeError("DISCORD_TOKEN missing (Railway -> playerbot -> Variables).")
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL missing.")
+        raise RuntimeError("DATABASE_URL missing (Railway Postgres -> DATABASE_URL).")
 
-    pool = await asyncpg.create_pool(DATABASE_URL)
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await init_db()
 
+    # Sync slash commands to your server (fast updates)
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
-        print(f"✅ Synced commands to guild {GUILD_ID}")
+        print(f"✅ Synced slash commands to guild {GUILD_ID}")
 
-    print(f"✅ Logged in as {bot.user}")
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-# ---------- Commands ----------
+# -------------------------
+# Commands
+# -------------------------
 
-@bot.tree.command(name="setteam", description="Create or update a team.")
+@bot.tree.command(name="setteam", description="Create/update a league team (owner/manager/logo).")
 @app_commands.describe(
-    team="Team name",
+    team="Team name (league team)",
     owner="Owner Roblox username",
-    manager="Manager Roblox username",
-    logo_asset_id="Roblox image asset id"
+    manager="Manager Roblox username (optional)",
+    logo_asset_id="Roblox image asset id (optional)"
 )
 @require_auth()
 async def setteam(
@@ -117,6 +151,8 @@ async def setteam(
     manager: str | None = None,
     logo_asset_id: int | None = None,
 ):
+    assert pool is not None
+
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -130,21 +166,25 @@ async def setteam(
             team, owner, manager, logo_asset_id
         )
 
-    embed = discord.Embed(title="Team Saved", color=discord.Color.green())
-    embed.add_field(name="Team", value=team)
-    embed.add_field(name="Owner", value=owner)
-    embed.add_field(name="Manager", value=manager or "None")
+    embed = discord.Embed(
+        title="✅ Team Saved",
+        description=f"**{team}** is now a valid league team.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Owner", value=owner, inline=True)
+    embed.add_field(name="Manager", value=manager or "None", inline=True)
+    embed.add_field(name="Logo Asset ID", value=str(logo_asset_id) if logo_asset_id else "None", inline=False)
     if logo_asset_id:
-        embed.set_thumbnail(url=rbxthumb_asset(logo_asset_id))
+        embed.set_thumbnail(url=rbxthumb_asset(int(logo_asset_id)))
 
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="rankplayer", description="Add or update a player.")
+@bot.tree.command(name="rankplayer", description="Rank/assign a Roblox player to a league team.")
 @app_commands.describe(
     robloxuser="Roblox username",
-    team="Team name",
-    rank="Rank"
+    team="League team (must exist)",
+    rank="Rank (Player/Manager/Owner/etc.)"
 )
 @require_auth()
 async def rankplayer(
@@ -153,132 +193,174 @@ async def rankplayer(
     team: str,
     rank: str,
 ):
-    now = dt.datetime.utcnow().isoformat()
+    assert pool is not None
+    now = utc_now_iso()
 
     async with pool.acquire() as conn:
+        # ✅ HARD BLOCK: team must exist in league
         exists = await conn.fetchval("SELECT 1 FROM teams WHERE name=$1", team)
         if not exists:
             return await interaction.response.send_message(
-                "❌ Team does not exist.", ephemeral=True
+                f"❌ **{team}** is not a valid league team.\n"
+                f"Create it first with `/setteam` (example: AC Milan).",
+                ephemeral=True
             )
+
+        old_team = await conn.fetchval(
+            "SELECT team_name FROM players WHERE roblox_user=$1",
+            robloxuser
+        )
 
         await conn.execute(
             """
             INSERT INTO players (roblox_user, team_name, rank, updated_at)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (roblox_user) DO UPDATE SET
-                team_name=$2, rank=$3, updated_at=$4;
+                team_name = EXCLUDED.team_name,
+                rank = EXCLUDED.rank,
+                updated_at = EXCLUDED.updated_at;
             """,
             robloxuser, team, rank, now
         )
 
-    await interaction.response.send_message(
-        f"✅ **{robloxuser}** ranked **{rank}** in **{team}**."
-    )
+        logo_asset_id = await conn.fetchval(
+            "SELECT logo_asset_id FROM teams WHERE name=$1",
+            team
+        )
+
+    if old_team and old_team.lower() != team.lower():
+        desc = f"🔄 **{robloxuser}** moved from **{old_team}** to **{team}** as **{rank}**"
+    elif old_team:
+        desc = f"✅ **{robloxuser}** updated in **{team}** as **{rank}**"
+    else:
+        desc = f"✅ **{robloxuser}** added to **{team}** as **{rank}**"
+
+    embed = discord.Embed(title="Player Ranked", description=desc, color=discord.Color.green())
+    embed.add_field(name="Updated", value=now, inline=False)
+    if logo_asset_id:
+        embed.set_thumbnail(url=rbxthumb_asset(int(logo_asset_id)))
+
+    await interaction.response.send_message(embed=embed)
 
 
-# ---------- TEAM VIEW ----------
-
-@bot.tree.command(name="teamview", description="View team info.")
+@bot.tree.command(name="teamview", description="View a league team’s owner/manager/players.")
 @app_commands.describe(teamname="Team name")
 @require_auth()
 async def teamview(interaction: discord.Interaction, teamname: str):
-    async with pool.acquire() as conn:
-        team = await conn.fetchrow(
-            "SELECT * FROM teams WHERE name=$1", teamname
-        )
+    assert pool is not None
 
-        if not team:
-            return await interaction.response.send_message(
-                "❌ Team not found.", ephemeral=True
-            )
+    async with pool.acquire() as conn:
+        team_row = await conn.fetchrow(
+            "SELECT owner_roblox, manager_roblox, logo_asset_id FROM teams WHERE name=$1",
+            teamname
+        )
+        if not team_row:
+            return await interaction.response.send_message("❌ Team not found.", ephemeral=True)
 
         players = await conn.fetch(
-            "SELECT roblox_user, rank FROM players WHERE team_name=$1 ORDER BY roblox_user",
+            "SELECT roblox_user, rank FROM players WHERE team_name=$1 ORDER BY LOWER(roblox_user)",
             teamname
         )
 
+    owner_roblox = team_row["owner_roblox"]
+    manager_roblox = team_row["manager_roblox"]
+    logo_asset_id = team_row["logo_asset_id"]
+
     embed = discord.Embed(
-        title=f"{teamname} ({len(players)} Players)",
-        color=discord.Color.blue(),
+        title=f"Information for {teamname} ({len(players)} Players)",
+        color=discord.Color.dark_teal(),
     )
+    embed.add_field(name="Owner", value=owner_roblox, inline=False)
+    embed.add_field(name="Manager", value=manager_roblox or "None", inline=False)
 
-    embed.add_field(name="Owner", value=team["owner_roblox"], inline=False)
-    embed.add_field(name="Manager", value=team["manager_roblox"] or "None", inline=False)
+    if logo_asset_id:
+        embed.set_thumbnail(url=rbxthumb_asset(int(logo_asset_id)))
+        embed.add_field(name="Logo Asset ID", value=str(logo_asset_id), inline=False)
 
-    if team["logo_asset_id"]:
-        embed.set_thumbnail(url=rbxthumb_asset(team["logo_asset_id"]))
-
-    if players:
-        embed.add_field(
-            name="Players",
-            value="\n".join(f"{p['roblox_user']} ({p['rank']})" for p in players),
-            inline=False,
-        )
-    else:
+    if not players:
         embed.add_field(name="Players", value="None", inline=False)
+    else:
+        # chunk into multiple fields if needed
+        lines = [f"{p['roblox_user']} ({p['rank'] or 'None'})" for p in players]
+        chunk = ""
+        part = 1
+        for line in lines:
+            add = ("\n" if chunk else "") + line
+            if len(chunk) + len(add) > 900:
+                embed.add_field(name=f"Players (Part {part})", value=chunk, inline=False)
+                part += 1
+                chunk = line
+            else:
+                chunk += add
+        if chunk:
+            embed.add_field(name=f"Players (Part {part})", value=chunk, inline=False)
 
     await interaction.response.send_message(embed=embed)
 
 
-# ---------- AUTOCOMPLETE (THIS IS THE NEW PART) ----------
-
-@teamview.autocomplete("teamname")
-async def teamname_autocomplete(interaction: discord.Interaction, current: str):
-    current = (current or "").lower()
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT name
-            FROM teams
-            WHERE LOWER(name) LIKE $1
-            ORDER BY name
-            LIMIT 25
-            """,
-            f"%{current}%"
-        )
-
-    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
-
-
-# ---------- PLAYER INFO ----------
-
-@bot.tree.command(name="playerinfo", description="View player info.")
+@bot.tree.command(name="playerinfo", description="Show league info about a Roblox player.")
 @app_commands.describe(robloxuser="Roblox username")
 @require_auth()
 async def playerinfo(interaction: discord.Interaction, robloxuser: str):
+    assert pool is not None
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT p.*, t.owner_roblox, t.manager_roblox, t.logo_asset_id
+            SELECT p.team_name, p.rank, p.updated_at,
+                   t.logo_asset_id, t.owner_roblox, t.manager_roblox
             FROM players p
-            LEFT JOIN teams t ON p.team_name = t.name
-            WHERE roblox_user=$1
+            LEFT JOIN teams t ON t.name = p.team_name
+            WHERE p.roblox_user=$1
             """,
-            robloxuser,
+            robloxuser
         )
 
     if not row:
-        return await interaction.response.send_message(
-            "❌ Player not found.", ephemeral=True
-        )
+        return await interaction.response.send_message("❌ Player not found.", ephemeral=True)
 
-    embed = discord.Embed(title=f"{robloxuser}'s Info", color=discord.Color.orange())
-    embed.add_field(name="Team", value=row["team_name"])
-    embed.add_field(name="Rank", value=row["rank"])
-    embed.add_field(name="Owner", value=row["owner_roblox"])
-    embed.add_field(name="Manager", value=row["manager_roblox"] or "None")
+    embed = discord.Embed(
+        title=f"{robloxuser}'s Information!",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="Team", value=row["team_name"], inline=True)
+    embed.add_field(name="Rank", value=row["rank"] or "None", inline=True)
+    embed.add_field(name="Last Update", value=row["updated_at"], inline=False)
+
+    embed.add_field(name="Team Owner", value=row["owner_roblox"] or "Unknown", inline=True)
+    embed.add_field(name="Team Manager", value=row["manager_roblox"] or "None", inline=True)
 
     if row["logo_asset_id"]:
-        embed.set_thumbnail(url=rbxthumb_asset(row["logo_asset_id"]))
+        embed.set_thumbnail(url=rbxthumb_asset(int(row["logo_asset_id"])))
+        embed.add_field(name="Logo Asset ID", value=str(row["logo_asset_id"]), inline=False)
 
     await interaction.response.send_message(embed=embed)
 
 
-# ---------- RUN ----------
+# -------------------------
+# Autocomplete (Dropdowns)
+# -------------------------
 
+# ✅ Makes /teamview look like your screenshot (type "s" and see matching teams)
+@teamview.autocomplete("teamname")
+async def teamname_autocomplete(interaction: discord.Interaction, current: str):
+    names = await fetch_team_names_like(current)
+    return [app_commands.Choice(name=n, value=n) for n in names]
+
+
+# ✅ Makes /rankplayer ONLY show league teams (prevents typing Liverpool by mistake)
+@rankplayer.autocomplete("team")
+async def rankplayer_team_autocomplete(interaction: discord.Interaction, current: str):
+    names = await fetch_team_names_like(current)
+    return [app_commands.Choice(name=n, value=n) for n in names]
+
+
+# -------------------------
+# Run
+# -------------------------
 bot.run(TOKEN)
+
+
 
 
 
