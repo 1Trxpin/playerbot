@@ -12,32 +12,19 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-ALLOWED_IDS = {
-int(x.strip())
-for x in os.getenv("ALLOWED_IDS", "").split(",")
-if x.strip().isdigit()
-}
-
-INTENTS = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
-
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 pool: asyncpg.Pool | None = None
-FREE_AGENT_TEAM = "Free Agent"
 
 routes = web.RouteTableDef()
+FREE_AGENT_TEAM = "Free Agent"
 
-# -------------------------
+# ----------------- HELPERS -----------------
 
-# Helpers
-
-# -------------------------
-
-def utc_now_iso() -> str:
+def utc_now_iso():
 return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
-async def roblox_username_to_userid(username: str) -> int | None:
+async def roblox_username_to_userid(username: str):
 url = "[https://users.roblox.com/v1/usernames/users](https://users.roblox.com/v1/usernames/users)"
 payload = {"usernames": [username], "excludeBannedUsers": False}
 
@@ -54,16 +41,15 @@ if not items:
 return int(items[0]["id"])
 ```
 
+# ----------------- DATABASE -----------------
+
 async def init_db():
-assert pool is not None
 async with pool.acquire() as conn:
 
 ```
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS teams (
             name TEXT PRIMARY KEY,
-            owner_roblox TEXT NOT NULL,
-            manager_roblox TEXT,
             logo_asset_id BIGINT
         );
     """)
@@ -72,27 +58,22 @@ async with pool.acquire() as conn:
         CREATE TABLE IF NOT EXISTS players (
             roblox_user_id BIGINT PRIMARY KEY,
             roblox_username TEXT NOT NULL,
-            team_name TEXT NOT NULL REFERENCES teams(name) ON DELETE RESTRICT,
-            rank TEXT,
+            team_name TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
     """)
 
     await conn.execute(
         """
-        INSERT INTO teams (name, owner_roblox, manager_roblox, logo_asset_id)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO teams (name, logo_asset_id)
+        VALUES ($1, $2)
         ON CONFLICT (name) DO NOTHING;
         """,
-        FREE_AGENT_TEAM, "System", None, None
+        FREE_AGENT_TEAM, None
     )
 ```
 
-# -------------------------
-
-# Bot lifecycle
-
-# -------------------------
+# ----------------- BOT START -----------------
 
 @bot.event
 async def setup_hook():
@@ -110,28 +91,14 @@ await site.start()
 @bot.event
 async def on_ready():
 global pool
-
-```
 pool = await asyncpg.create_pool(DATABASE_URL)
 await init_db()
+print("BOT ONLINE:", bot.user)
 
-if GUILD_ID:
-    guild = discord.Object(id=GUILD_ID)
-    bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild)
-
-print(f"Logged in as {bot.user}")
-```
-
-# -------------------------
-
-# Rank player (UserId system)
-
-# -------------------------
+# ----------------- COMMANDS -----------------
 
 @bot.tree.command(name="rankplayer")
-@app_commands.check(lambda i: i.user.id in ALLOWED_IDS)
-async def rankplayer(interaction: discord.Interaction, robloxuser: str, team: str, rank: str):
+async def rankplayer(interaction: discord.Interaction, robloxuser: str, team: str):
 
 ```
 user_id = await roblox_username_to_userid(robloxuser)
@@ -143,53 +110,20 @@ now = utc_now_iso()
 async with pool.acquire() as conn:
     await conn.execute(
         """
-        INSERT INTO players (roblox_user_id, roblox_username, team_name, rank, updated_at)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO players (roblox_user_id, roblox_username, team_name, updated_at)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (roblox_user_id) DO UPDATE SET
             roblox_username = EXCLUDED.roblox_username,
             team_name = EXCLUDED.team_name,
-            rank = EXCLUDED.rank,
             updated_at = EXCLUDED.updated_at;
         """,
-        user_id, robloxuser, team, rank, now
+        user_id, robloxuser, team, now
     )
 
 await interaction.response.send_message(f"{robloxuser} ranked to {team}.")
 ```
 
-@bot.tree.command(name="unrank")
-@app_commands.check(lambda i: i.user.id in ALLOWED_IDS)
-async def unrank(interaction: discord.Interaction, robloxuser: str):
-
-```
-user_id = await roblox_username_to_userid(robloxuser)
-if not user_id:
-    return await interaction.response.send_message("Roblox user not found.", ephemeral=True)
-
-now = utc_now_iso()
-
-async with pool.acquire() as conn:
-    await conn.execute(
-        """
-        INSERT INTO players (roblox_user_id, roblox_username, team_name, rank, updated_at)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (roblox_user_id) DO UPDATE SET
-            roblox_username = EXCLUDED.roblox_username,
-            team_name = EXCLUDED.team_name,
-            rank = EXCLUDED.rank,
-            updated_at = EXCLUDED.updated_at;
-        """,
-        user_id, robloxuser, FREE_AGENT_TEAM, "Free Agent", now
-    )
-
-await interaction.response.send_message(f"{robloxuser} is now Free Agent.")
-```
-
-# -------------------------
-
-# API for Roblox
-
-# -------------------------
+# ----------------- ROBLOX API -----------------
 
 @routes.get("/leaderboard")
 async def leaderboard_api(request):
@@ -216,6 +150,8 @@ return web.json_response([
 ```
 
 bot.run(TOKEN)
+
+
 
 
 
