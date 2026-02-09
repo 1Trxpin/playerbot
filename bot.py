@@ -105,17 +105,17 @@ async def init_db():
         """)
 
         # New players table (UserId-based)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                roblox_user_id BIGINT PRIMARY KEY,
-                roblox_username TEXT NOT NULL,
-                team_name TEXT NOT NULL REFERENCES teams(name) ON DELETE RESTRICT,
-                rank TEXT,
-                updated_at TEXT NOT NULL
-            );
-        """)
+      await conn.execute("""
+    CREATE TABLE IF NOT EXISTS players_v2 (
+        roblox_user_id BIGINT PRIMARY KEY,
+        roblox_username TEXT NOT NULL,
+        team_name TEXT NOT NULL REFERENCES teams(name) ON DELETE RESTRICT,
+        rank TEXT,
+        updated_at TEXT NOT NULL
+    );
+""")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_players_v2_team ON players_v2(team_name);")
 
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_name);")
 
         # Ensure "Free Agent" team always exists
         await conn.execute(
@@ -551,6 +551,7 @@ async def leaderboard_api(request):
 # -------------------------
 
 bot.run(TOKEN)
+
 
 
 
