@@ -194,21 +194,20 @@ async def player_api(request):
 
 
 async def start_web_server():
-    """Railway needs you to listen on the PORT env var."""
-    global web_runner
-
-   PORT = 8000
+    # Railway is routing your domain to port 8000, so we force 8000.
+    PORT = 8000
 
     app = web.Application()
     app.add_routes(routes)
 
-    web_runner = web.AppRunner(app)
-    await web_runner.setup()
+    runner = web.AppRunner(app)
+    await runner.setup()
 
-    site = web.TCPSite(web_runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
     print(f"🌐 Web API listening on port {PORT}")
+
 
 
 # -------------------------
@@ -534,6 +533,7 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
 # Run
 # -------------------------
 bot.run(TOKEN)
+
 
 
 
