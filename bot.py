@@ -7,6 +7,7 @@ from discord.ext import commands
 
 import asyncpg
 from dotenv import load_dotenv
+from aiohttp import web
 
 load_dotenv()
 
@@ -27,7 +28,6 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 pool: asyncpg.Pool | None = None
 
 FREE_AGENT_TEAM = "Free Agent"
-
 
 # -------------------------
 # Helpers
@@ -120,6 +120,59 @@ async def fetch_team_names_like(current: str, include_free_agent: bool = True) -
             )
 
     return [r["name"] for r in rows]
+
+
+# -------------------------
+# WEB API for Roblox (Railway)
+# -------------------------
+
+routes = web.RouteTableDef()
+
+
+@routes.get("/leaderboard")
+async def leaderboard_api(request):
+    """Return all ranked players + team logos for Roblox."""
+    assert pool is not None
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.roblox_user, p.team_name, t.logo_asset_id
+            FROM players p
+            LEFT JOIN teams t ON t.name = p.team_name
+            ORDER BY LOWER(p.roblox_user)
+            """
+        )
+
+    return web.json_response([
+        {
+            "player": r["roblox_user"],
+            "team": r["team_name"],
+            "logo": r["logo_asset_id"],  # can be null
+        }
+        for r in rows
+    ])
+
+
+async def start_web_server():
+    """Start aiohttp server on Railway's PORT."""
+    app = web.Application()
+    app.add_routes(routes)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "8000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    print(f"🌐 Web API listening on port {port}")
+
+
+@bot.event
+async def setup_hook():
+    # start the web server once, before the bot fully comes online
+    await start_web_server()
 
 
 # -------------------------
@@ -317,7 +370,6 @@ async def unrank(interaction: discord.Interaction, robloxuser: str):
     now = utc_now_iso()
 
     async with pool.acquire() as conn:
-        # If player doesn't exist, create them as Free Agent
         await conn.execute(
             """
             INSERT INTO players (roblox_user, team_name, rank, updated_at)
@@ -430,21 +482,18 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
 
 @teamview.autocomplete("teamname")
 async def teamname_autocomplete(interaction: discord.Interaction, current: str):
-    # include Free Agent in teamview suggestions
     names = await fetch_team_names_like(current, include_free_agent=True)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 
 @rankplayer.autocomplete("team")
 async def rankplayer_team_autocomplete(interaction: discord.Interaction, current: str):
-    # EXCLUDE Free Agent from rank dropdown (use /unrank instead)
     names = await fetch_team_names_like(current, include_free_agent=False)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
 
 @deleteteam.autocomplete("teamname")
 async def deleteteam_autocomplete(interaction: discord.Interaction, current: str):
-    # Exclude Free Agent from delete dropdown
     names = await fetch_team_names_like(current, include_free_agent=False)
     return [app_commands.Choice(name=n, value=n) for n in names]
 
@@ -454,6 +503,8 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
 # -------------------------
 
 bot.run(TOKEN)
+
+
 
 
 
