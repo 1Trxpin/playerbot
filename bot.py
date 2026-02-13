@@ -197,7 +197,7 @@ async def start_web_server():
     """Railway needs you to listen on the PORT env var."""
     global web_runner
 
-    PORT = int(os.getenv("PORT", "8000"))
+   PORT = 8000
 
     app = web.Application()
     app.add_routes(routes)
@@ -534,6 +534,7 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
 # Run
 # -------------------------
 bot.run(TOKEN)
+
 
 
 
