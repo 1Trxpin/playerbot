@@ -209,7 +209,6 @@ async def start_web_server():
     print(f"🌐 Web API listening on port {PORT}")
 
 
-
 # -------------------------
 # Bot lifecycle
 # -------------------------
@@ -470,6 +469,9 @@ async def teamview(interaction: discord.Interaction, teamname: str):
     await interaction.response.send_message(embed=embed)
 
 
+# -------------------------
+# UPDATED /playerinfo (matches your embed headings, NO Semi)
+# -------------------------
 @bot.tree.command(name="playerinfo", description="Show info about a Roblox player.")
 @app_commands.describe(robloxuser="Roblox username")
 async def playerinfo(interaction: discord.Interaction, robloxuser: str):
@@ -478,10 +480,8 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT p.team_name, p.rank, p.updated_at,
-                   t.logo_asset_id, t.owner_roblox, t.manager_roblox
+            SELECT p.team_name, p.rank, p.updated_at
             FROM players p
-            LEFT JOIN teams t ON t.name = p.team_name
             WHERE LOWER(p.roblox_user) = LOWER($1)
             """,
             robloxuser
@@ -490,20 +490,31 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     if not row:
         return await interaction.response.send_message("❌ Player not found.", ephemeral=True)
 
+    team_name = row["team_name"] or FREE_AGENT_TEAM
+    rank = (row["rank"] or "None").strip().lower()
+    updated = row["updated_at"] or "Unknown"
+
+    # You can expand these later with real systems
+    division = "None"
+    suspended = "❌"
+
+    manager_status = "✅" if rank == "manager" else "❌"
+    staff_status = "✅" if rank in ("staff", "owner", "admin") else "❌"
+
     embed = discord.Embed(
         title=f"{robloxuser}'s Information!",
         color=discord.Color.orange(),
     )
-    embed.add_field(name="Team", value=row["team_name"], inline=True)
-    embed.add_field(name="Rank", value=row["rank"] or "None", inline=True)
-    embed.add_field(name="Last Update", value=row["updated_at"], inline=False)
+    embed.add_field(name="Last Update", value=updated, inline=False)
 
-    embed.add_field(name="Team Owner", value=row["owner_roblox"] or "Unknown", inline=True)
-    embed.add_field(name="Team Manager", value=row["manager_roblox"] or "None", inline=True)
+    # Top row
+    embed.add_field(name="Team", value=team_name, inline=True)
+    embed.add_field(name="Division", value=division, inline=True)
+    embed.add_field(name="Suspended", value=suspended, inline=True)
 
-    if row["logo_asset_id"]:
-        embed.set_thumbnail(url=rbxthumb_asset(int(row["logo_asset_id"])))
-        embed.add_field(name="Logo Asset ID", value=str(row["logo_asset_id"]), inline=False)
+    # Bottom row (NO Semi)
+    embed.add_field(name="Manager", value=manager_status, inline=True)
+    embed.add_field(name="Staff", value=staff_status, inline=True)
 
     await interaction.response.send_message(embed=embed)
 
@@ -533,6 +544,7 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
 # Run
 # -------------------------
 bot.run(TOKEN)
+
 
 
 
