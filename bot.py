@@ -470,7 +470,8 @@ async def teamview(interaction: discord.Interaction, teamname: str):
 
 
 # -------------------------
-# UPDATED /playerinfo (matches your embed headings, NO Semi)
+# UPDATED /playerinfo:
+# If rank is Manager or Owner, show "Team Owner ID" (owner_roblox from teams table)
 # -------------------------
 @bot.tree.command(name="playerinfo", description="Show info about a Roblox player.")
 @app_commands.describe(robloxuser="Roblox username")
@@ -480,8 +481,10 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT p.team_name, p.rank, p.updated_at
+            SELECT p.team_name, p.rank, p.updated_at,
+                   t.owner_roblox
             FROM players p
+            LEFT JOIN teams t ON t.name = p.team_name
             WHERE LOWER(p.roblox_user) = LOWER($1)
             """,
             robloxuser
@@ -491,15 +494,18 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
         return await interaction.response.send_message("❌ Player not found.", ephemeral=True)
 
     team_name = row["team_name"] or FREE_AGENT_TEAM
-    rank = (row["rank"] or "None").strip().lower()
+    rank_raw = (row["rank"] or "None")
+    rank_norm = rank_raw.strip().lower()
     updated = row["updated_at"] or "Unknown"
+    team_owner_id = row["owner_roblox"] or "Unknown"
 
-    # You can expand these later with real systems
+    # You can wire these later
     division = "None"
     suspended = "❌"
 
-    manager_status = "✅" if rank == "manager" else "❌"
-    staff_status = "✅" if rank in ("staff", "owner", "admin") else "❌"
+    manager_status = "✅" if rank_norm == "manager" else "❌"
+    owner_status = "✅" if rank_norm == "owner" else "❌"
+    staff_status = "✅" if rank_norm in ("staff", "owner", "admin") else "❌"
 
     embed = discord.Embed(
         title=f"{robloxuser}'s Information!",
@@ -507,14 +513,19 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     )
     embed.add_field(name="Last Update", value=updated, inline=False)
 
-    # Top row
+    # Row 1
     embed.add_field(name="Team", value=team_name, inline=True)
     embed.add_field(name="Division", value=division, inline=True)
     embed.add_field(name="Suspended", value=suspended, inline=True)
 
-    # Bottom row (NO Semi)
+    # Row 2 (no Semi)
     embed.add_field(name="Manager", value=manager_status, inline=True)
+    embed.add_field(name="Owner", value=owner_status, inline=True)
     embed.add_field(name="Staff", value=staff_status, inline=True)
+
+    # Only show Team Owner ID if they are Manager or Owner (and not Free Agent)
+    if team_name.lower() != FREE_AGENT_TEAM.lower() and rank_norm in ("manager", "owner"):
+        embed.add_field(name="Team Owner ID", value=str(team_owner_id), inline=False)
 
     await interaction.response.send_message(embed=embed)
 
