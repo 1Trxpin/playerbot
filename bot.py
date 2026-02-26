@@ -37,7 +37,6 @@ pool: asyncpg.Pool | None = None
 
 # Web API (Roblox)
 routes = web.RouteTableDef()
-web_runner: web.AppRunner | None = None
 
 
 # -------------------------
@@ -69,8 +68,11 @@ def require_allowed_only():
     return app_commands.check(predicate)
 
 
+# -------------------------
+# Database
+# -------------------------
 async def init_db():
-    """Create tables + ensure Free Agent exists."""
+    """Create tables + ensure Free Agent exists + add division column if missing."""
     assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -78,9 +80,17 @@ async def init_db():
                 name TEXT PRIMARY KEY,
                 owner_roblox TEXT NOT NULL,
                 manager_roblox TEXT,
-                logo_asset_id BIGINT
+                logo_asset_id BIGINT,
+                division TEXT
             );
         """)
+
+        # Safe migration if older DB existed without division
+        try:
+            await conn.execute("ALTER TABLE teams ADD COLUMN division TEXT;")
+        except asyncpg.exceptions.DuplicateColumnError:
+            pass
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 roblox_user TEXT PRIMARY KEY,
@@ -93,11 +103,11 @@ async def init_db():
         # Ensure Free Agent team always exists
         await conn.execute(
             """
-            INSERT INTO teams (name, owner_roblox, manager_roblox, logo_asset_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO teams (name, owner_roblox, manager_roblox, logo_asset_id, division)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (name) DO NOTHING;
             """,
-            FREE_AGENT_TEAM, "System", None, None
+            FREE_AGENT_TEAM, "System", None, None, "None"
         )
 
 
@@ -172,7 +182,8 @@ async def player_api(request):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT p.roblox_user, p.team_name, p.rank, p.updated_at, t.logo_asset_id
+            SELECT p.roblox_user, p.team_name, p.rank, p.updated_at,
+                   t.logo_asset_id, t.division
             FROM players p
             LEFT JOIN teams t ON t.name = p.team_name
             WHERE LOWER(p.roblox_user) = LOWER($1)
@@ -190,6 +201,7 @@ async def player_api(request):
         "rank": row["rank"],
         "updated_at": row["updated_at"],
         "logo": row["logo_asset_id"],
+        "division": row["division"] or "None",
     })
 
 
@@ -248,7 +260,8 @@ async def on_ready():
     team="Team name (league team)",
     owner="Owner Roblox username",
     manager="Manager Roblox username (optional)",
-    logo_asset_id="Roblox image asset id (optional)"
+    logo_asset_id="Roblox image asset id (optional)",
+    division="Division name (e.g. Division 1, Division 2)"
 )
 @require_allowed_only()
 async def setteam(
@@ -257,6 +270,7 @@ async def setteam(
     owner: str,
     manager: str | None = None,
     logo_asset_id: int | None = None,
+    division: str | None = None,
 ):
     assert pool is not None
 
@@ -266,17 +280,20 @@ async def setteam(
             ephemeral=True
         )
 
+    div_value = (division or "None").strip() or "None"
+
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO teams (name, owner_roblox, manager_roblox, logo_asset_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO teams (name, owner_roblox, manager_roblox, logo_asset_id, division)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (name) DO UPDATE SET
                 owner_roblox = EXCLUDED.owner_roblox,
                 manager_roblox = EXCLUDED.manager_roblox,
-                logo_asset_id = EXCLUDED.logo_asset_id;
+                logo_asset_id = EXCLUDED.logo_asset_id,
+                division = EXCLUDED.division;
             """,
-            team, owner, manager, logo_asset_id
+            team, owner, manager, logo_asset_id, div_value
         )
 
     embed = discord.Embed(
@@ -286,6 +303,7 @@ async def setteam(
     )
     embed.add_field(name="Owner", value=owner, inline=True)
     embed.add_field(name="Manager", value=manager or "None", inline=True)
+    embed.add_field(name="Division", value=div_value, inline=True)
     embed.add_field(
         name="Logo Asset ID",
         value=str(logo_asset_id) if logo_asset_id else "None",
@@ -427,7 +445,7 @@ async def teamview(interaction: discord.Interaction, teamname: str):
 
     async with pool.acquire() as conn:
         team_row = await conn.fetchrow(
-            "SELECT owner_roblox, manager_roblox, logo_asset_id FROM teams WHERE name=$1",
+            "SELECT owner_roblox, manager_roblox, logo_asset_id, division FROM teams WHERE name=$1",
             teamname
         )
         if not team_row:
@@ -444,6 +462,7 @@ async def teamview(interaction: discord.Interaction, teamname: str):
     )
     embed.add_field(name="Owner", value=team_row["owner_roblox"], inline=False)
     embed.add_field(name="Manager", value=team_row["manager_roblox"] or "None", inline=False)
+    embed.add_field(name="Division", value=team_row["division"] or "None", inline=False)
 
     if team_row["logo_asset_id"]:
         embed.set_thumbnail(url=rbxthumb_asset(int(team_row["logo_asset_id"])))
@@ -470,8 +489,7 @@ async def teamview(interaction: discord.Interaction, teamname: str):
 
 
 # -------------------------
-# UPDATED /playerinfo:
-# If rank is Manager or Owner, show "Team Owner ID" (owner_roblox from teams table)
+# /playerinfo (shows Division from team + optional Team Owner ID)
 # -------------------------
 @bot.tree.command(name="playerinfo", description="Show info about a Roblox player.")
 @app_commands.describe(robloxuser="Roblox username")
@@ -482,7 +500,7 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
         row = await conn.fetchrow(
             """
             SELECT p.team_name, p.rank, p.updated_at,
-                   t.owner_roblox
+                   t.owner_roblox, t.division
             FROM players p
             LEFT JOIN teams t ON t.name = p.team_name
             WHERE LOWER(p.roblox_user) = LOWER($1)
@@ -497,12 +515,10 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     rank_raw = (row["rank"] or "None")
     rank_norm = rank_raw.strip().lower()
     updated = row["updated_at"] or "Unknown"
+    division = row["division"] or "None"
     team_owner_id = row["owner_roblox"] or "Unknown"
 
-    # You can wire these later
-    division = "None"
     suspended = "❌"
-
     manager_status = "✅" if rank_norm == "manager" else "❌"
     owner_status = "✅" if rank_norm == "owner" else "❌"
     staff_status = "✅" if rank_norm in ("staff", "owner", "admin") else "❌"
@@ -513,12 +529,10 @@ async def playerinfo(interaction: discord.Interaction, robloxuser: str):
     )
     embed.add_field(name="Last Update", value=updated, inline=False)
 
-    # Row 1
     embed.add_field(name="Team", value=team_name, inline=True)
     embed.add_field(name="Division", value=division, inline=True)
     embed.add_field(name="Suspended", value=suspended, inline=True)
 
-    # Row 2 (no Semi)
     embed.add_field(name="Manager", value=manager_status, inline=True)
     embed.add_field(name="Owner", value=owner_status, inline=True)
     embed.add_field(name="Staff", value=staff_status, inline=True)
@@ -555,6 +569,7 @@ async def deleteteam_autocomplete(interaction: discord.Interaction, current: str
 # Run
 # -------------------------
 bot.run(TOKEN)
+
 
 
 
